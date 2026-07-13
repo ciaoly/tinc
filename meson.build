@@ -29,6 +29,7 @@ opt_vmnet = get_option('vmnet')
 opt_uml = get_option('uml')
 opt_vde = get_option('vde')
 opt_zlib = get_option('zlib')
+opt_websocket = get_option('websocket')
 
 meson_version = meson.version()
 

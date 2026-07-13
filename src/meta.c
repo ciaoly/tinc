@@ -27,6 +27,7 @@
 #include "connection.h"
 #include "logger.h"
 #include "meta.h"
+#include "meta_ws.h"
 #include "net.h"
 #include "protocol.h"
 #include "utils.h"
@@ -47,8 +48,12 @@ bool send_meta_sptps(void *handle, uint8_t type, const void *buffer, size_t leng
 		abort();
 	}
 
-	buffer_add(&c->outbuf, buffer, length);
-	io_set(&c->io, IO_READ | IO_WRITE);
+	if(meta_ws_ready(c)) {
+		return meta_ws_send(c, buffer, length);
+	} else {
+		buffer_add(&c->outbuf, buffer, length);
+		io_set(&c->io, IO_READ | IO_WRITE);
+	}
 
 	return true;
 }
@@ -79,16 +84,24 @@ bool send_meta(connection_t *c, const void *buffer, size_t length) {
 		}
 
 		size_t outlen = length;
+		char *out = meta_ws_ready(c) ? alloca(length) : buffer_prepare(&c->outbuf, length);
 
-		if(!cipher_encrypt(&c->legacy->out.cipher, buffer, length, buffer_prepare(&c->outbuf, length), &outlen, false) || outlen != length) {
+		if(!cipher_encrypt(&c->legacy->out.cipher, buffer, length, out, &outlen, false) || outlen != length) {
 			logger(DEBUG_ALWAYS, LOG_ERR, "Error while encrypting metadata to %s (%s)",
 			       c->name, c->hostname);
 			return false;
 		}
 
+		if(meta_ws_ready(c)) {
+			return meta_ws_send(c, out, outlen);
+		}
 #endif
 	} else {
-		buffer_add(&c->outbuf, buffer, length);
+		if(meta_ws_ready(c)) {
+			return meta_ws_send(c, buffer, length);
+		} else {
+			buffer_add(&c->outbuf, buffer, length);
+		}
 	}
 
 	io_set(&c->io, IO_READ | IO_WRITE);
@@ -105,9 +118,14 @@ void send_meta_raw(connection_t *c, const void *buffer, size_t length) {
 	logger(DEBUG_META, LOG_DEBUG, "Sending %lu bytes of raw metadata to %s (%s)",
 	       (unsigned long)length, c->name, c->hostname);
 
-	buffer_add(&c->outbuf, buffer, length);
-
-	io_set(&c->io, IO_READ | IO_WRITE);
+	if(meta_ws_ready(c)) {
+		if(!meta_ws_send(c, buffer, length)) {
+			logger(DEBUG_ALWAYS, LOG_ERR, "Could not send WebSocket metadata to %s (%s)", c->name, c->hostname);
+		}
+	} else {
+		buffer_add(&c->outbuf, buffer, length);
+		io_set(&c->io, IO_READ | IO_WRITE);
+	}
 }
 
 void broadcast_meta(connection_t *from, const char *buffer, size_t length) {
@@ -161,10 +179,8 @@ bool receive_meta_sptps(void *handle, uint8_t type, const void *vdata, uint16_t 
 	return receive_request(c, data);
 }
 
-bool receive_meta(connection_t *c) {
-	ssize_t inlen;
-	char inbuf[MAXBUFSIZE];
-	char *bufp = inbuf, *endp;
+bool receive_meta_bytes(connection_t *c, const void *data, ssize_t inlen) {
+	char *bufp = (char *)data, *endp;
 
 	/* Strategy:
 	   - Read as much as possible from the TCP socket in one go.
@@ -177,23 +193,8 @@ bool receive_meta(connection_t *c) {
 
 	buffer_compact(&c->inbuf, MAXBUFSIZE);
 
-	if(sizeof(inbuf) <= c->inbuf.len) {
+	if(MAXBUFSIZE <= c->inbuf.len) {
 		logger(DEBUG_ALWAYS, LOG_ERR, "Input buffer full for %s (%s)", c->name, c->hostname);
-		return false;
-	}
-
-	inlen = recv(c->socket, inbuf, sizeof(inbuf) - c->inbuf.len, 0);
-
-	if(inlen <= 0) {
-		if(!inlen || !sockerrno) {
-			logger(DEBUG_CONNECTIONS, LOG_NOTICE, "Connection closed by %s (%s)",
-			       c->name, c->hostname);
-		} else if(sockwouldblock(sockerrno)) {
-			return true;
-		} else
-			logger(DEBUG_ALWAYS, LOG_ERR, "Metadata socket read error for %s (%s): %s",
-			       c->name, c->hostname, sockstrerror(sockerrno));
-
 		return false;
 	}
 
@@ -319,4 +320,37 @@ bool receive_meta(connection_t *c) {
 	} while(inlen);
 
 	return true;
+}
+
+bool receive_meta(connection_t *c) {
+	ssize_t inlen;
+	char inbuf[MAXBUFSIZE];
+
+	if(c->meta_ws) {
+		return meta_ws_receive(c);
+	}
+
+	buffer_compact(&c->inbuf, MAXBUFSIZE);
+
+	if(sizeof(inbuf) <= c->inbuf.len) {
+		logger(DEBUG_ALWAYS, LOG_ERR, "Input buffer full for %s (%s)", c->name, c->hostname);
+		return false;
+	}
+
+	inlen = recv(c->socket, inbuf, sizeof(inbuf) - c->inbuf.len, 0);
+
+	if(inlen <= 0) {
+		if(!inlen || !sockerrno) {
+			logger(DEBUG_CONNECTIONS, LOG_NOTICE, "Connection closed by %s (%s)",
+			       c->name, c->hostname);
+		} else if(sockwouldblock(sockerrno)) {
+			return true;
+		} else
+			logger(DEBUG_ALWAYS, LOG_ERR, "Metadata socket read error for %s (%s): %s",
+			       c->name, c->hostname, sockstrerror(sockerrno));
+
+		return false;
+	}
+
+	return receive_meta_bytes(c, inbuf, inlen);
 }

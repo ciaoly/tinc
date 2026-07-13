@@ -28,6 +28,7 @@
 #include "crypto.h"
 #include "list.h"
 #include "logger.h"
+#include "meta_ws.h"
 #include "names.h"
 #include "net.h"
 #include "netutl.h"
@@ -422,7 +423,11 @@ void finish_connecting(connection_t *c) {
 	c->last_ping_time = now.tv_sec;
 	c->status.connecting = false;
 
-	send_id(c);
+	if(meta_ws_enabled) {
+		meta_ws_start_client(c);
+	} else {
+		send_id(c);
+	}
 }
 
 static void do_outgoing_pipe(connection_t *c, const char *command) {
@@ -770,6 +775,10 @@ void handle_new_meta_connection(void *data, int flags) {
 	configure_tcp(c);
 
 	connection_add(c);
+
+	if(meta_ws_enabled) {
+		meta_ws_start_server(c);
+	}
 
 	c->allow_request = ID;
 }

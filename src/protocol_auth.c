@@ -31,6 +31,7 @@
 #include "graph.h"
 #include "logger.h"
 #include "meta.h"
+#include "meta_ws.h"
 #include "names.h"
 #include "net.h"
 #include "netutl.h"
@@ -108,7 +109,7 @@ bool send_id(connection_t *c) {
 		}
 	}
 
-	if(proxytype && c->outgoing)
+	if(proxytype && c->outgoing && !meta_ws_active(c))
 		if(!send_proxyrequest(c)) {
 			return false;
 		}

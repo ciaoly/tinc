@@ -26,6 +26,7 @@
 #include "conf.h"
 #include "control_common.h"
 #include "logger.h"
+#include "meta_ws.h"
 #include "net.h"
 #include "rsa.h"
 #include "utils.h"
@@ -126,6 +127,7 @@ void free_connection(connection_t *c) {
 #endif
 
 	sptps_stop(&c->sptps);
+	meta_ws_free(c);
 	ecdsa_free(c->ecdsa);
 
 	free(c->hischallenge);

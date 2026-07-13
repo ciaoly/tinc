@@ -83,6 +83,8 @@ legacy_ctx_t *new_legacy_ctx(rsa_t *rsa);
 void free_legacy_ctx(legacy_ctx_t *ctx);
 #endif
 
+typedef struct meta_ws_t meta_ws_t;
+
 typedef struct connection_t {
 	char *name;                     /* name he claims to have */
 	char *hostname;                 /* the hostname of its real ip */
@@ -117,6 +119,7 @@ typedef struct connection_t {
 	struct buffer_t inbuf;
 	struct buffer_t outbuf;
 	io_t io;                        /* input/output event on this metadata connection */
+	meta_ws_t *meta_ws;             /* WebSocket transport state for this metadata connection */
 	uint32_t tcplen;                /* length of incoming TCPpacket */
 	uint32_t sptpslen;              /* length of incoming SPTPS packet */
 	int allow_request;              /* defined if there's only one request possible */

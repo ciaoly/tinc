@@ -34,6 +34,7 @@
 #include "ecdsa.h"
 #include "graph.h"
 #include "logger.h"
+#include "meta_ws.h"
 #include "names.h"
 #include "net.h"
 #include "netutl.h"
@@ -376,6 +377,15 @@ bool setup_myself_reloadable(void) {
 		}
 
 		free_string(proxy);
+	}
+
+	if(!meta_ws_configure()) {
+		return false;
+	}
+
+	if(meta_ws_enabled && proxytype) {
+		logger(DEBUG_ALWAYS, LOG_ERR, "MetaTransport websocket cannot be combined with Proxy in this implementation");
+		return false;
 	}
 
 	bool choice;

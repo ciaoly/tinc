@@ -156,6 +156,7 @@ src_tincd = [
   'event.c',
   'graph.c',
   'meta.c',
+  'meta_ws.c',
   'multicast_device.c',
   'net.c',
   'net_packet.c',
@@ -187,6 +188,13 @@ cc_flags_tincd = cc_flags
 deps_common = []
 deps_tinc = []
 deps_tincd = [cc.find_library('m', required: false)]
+
+dep_wslay = dependency('wslay', required: opt_websocket, static: static)
+if dep_wslay.found()
+  cdata.set('HAVE_WSLAY', 1)
+  deps_tincd += dep_wslay
+  cc_flags_tincd += '-DHAVE_WSLAY'
+endif
 
 if os_name != 'windows'
   src_lib_common += 'random.c'

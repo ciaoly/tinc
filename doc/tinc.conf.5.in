@@ -463,6 +463,23 @@ When this option is used the priority of the
 .Nm tincd
 process will be adjusted.
 Increasing the priority may help to reduce latency and packet loss on the VPN.
+.It Va MetaTransport Li = tcp | websocket Po tcp Pc Bq experimental
+Selects the transport used for TCP metadata connections.
+When set to
+.Ar websocket ,
+metadata bytes are carried in WebSocket binary messages after a HTTP Upgrade handshake.
+This requires
+.Nm tinc
+to be built with WebSocket support.
+This mode currently cannot be combined with
+.Va Proxy .
+.It Va MetaWebSocketPath Li = Ar path Po Pa /tinc Pc Bq experimental
+The HTTP request path used for WebSocket metadata connections.
+The path must start with
+.Pa / .
+.It Va MetaWebSocketKey Li = Ar key Bq experimental
+If set, enables a pre-shared-key encryption layer for metadata carried inside WebSocket messages.
+Both peers must use the same key.
 .It Va Proxy Li = socks4 | socks5 | http | exec Ar ... Bq experimental
 Use a proxy when making outgoing connections.
 The following proxy types are currently supported:

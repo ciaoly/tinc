@@ -69,6 +69,11 @@ option('zlib',
        value: 'auto',
        description: 'zlib compression support')
 
+option('websocket',
+       type: 'feature',
+       value: 'disabled',
+       description: 'WebSocket transport support for TCP metadata connections')
+
 option('uml',
        type: 'boolean',
        value: false,

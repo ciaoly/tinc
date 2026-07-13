@@ -1,0 +1,142 @@
+name: WebSocket build
+
+on:
+  push:
+    paths:
+      - ".github/workflows/websocket-build.yml"
+      - "meson.build"
+      - "meson_options.txt"
+      - "src/**"
+      - "doc/tinc.conf.5.in"
+  pull_request:
+    paths:
+      - ".github/workflows/websocket-build.yml"
+      - "meson.build"
+      - "meson_options.txt"
+      - "src/**"
+      - "doc/tinc.conf.5.in"
+  workflow_dispatch:
+
+concurrency:
+  group: websocket-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux WebSocket build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            meson \
+            ninja-build \
+            pkg-config \
+            libssl-dev \
+            zlib1g-dev \
+            libwslay-dev
+
+      - name: Configure
+        run: >
+          meson setup build-websocket
+          -Dwebsocket=enabled
+          -Dstatic=disabled
+          -Ddocs=disabled
+          -Dtests=disabled
+          -Dminiupnpc=disabled
+          -Dreadline=disabled
+          -Dcurses=disabled
+          -Dlzo=disabled
+          -Dlz4=disabled
+          -Dzlib=enabled
+
+      - name: Build
+        run: meson compile -C build-websocket --verbose
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifact-linux
+          cp build-websocket/src/tinc artifact-linux/
+          cp build-websocket/src/tincd artifact-linux/
+          ldd artifact-linux/tincd > artifact-linux/tincd.ldd.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: tinc-websocket-linux-x86_64
+          path: artifact-linux/
+
+  windows:
+    name: Windows WebSocket build
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          msystem: MINGW64
+          install: >-
+            base-devel
+            git
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-zlib
+
+      - name: Install wslay
+        shell: msys2 {0}
+        run: |
+          pacman -S --needed --noconfirm mingw-w64-x86_64-wslay || \
+          pacman -S --needed --noconfirm mingw-w64-x86_64-libwslay
+
+      - name: Configure
+        shell: msys2 {0}
+        run: >
+          meson setup build-websocket
+          -Dwebsocket=enabled
+          -Dstatic=disabled
+          -Ddocs=disabled
+          -Dtests=disabled
+          -Dminiupnpc=disabled
+          -Dreadline=disabled
+          -Dcurses=disabled
+          -Dlzo=disabled
+          -Dlz4=disabled
+          -Dzlib=enabled
+
+      - name: Build
+        shell: msys2 {0}
+        run: meson compile -C build-websocket --verbose
+
+      - name: Collect artifacts
+        shell: msys2 {0}
+        run: |
+          mkdir -p artifact-windows
+          cp build-websocket/src/tinc.exe artifact-windows/
+          cp build-websocket/src/tincd.exe artifact-windows/
+          for exe in artifact-windows/*.exe; do
+            ldd "$exe" | awk '/mingw64/ { print $3 }' | while read -r dll; do
+              [ -n "$dll" ] && cp -n "$dll" artifact-windows/
+            done
+          done
+          ldd artifact-windows/tincd.exe > artifact-windows/tincd.ldd.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: tinc-websocket-windows-x86_64
+          path: artifact-windows/

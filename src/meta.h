@@ -29,5 +29,6 @@ extern bool send_meta_sptps(void *handle, uint8_t type, const void *data, size_t
 extern bool receive_meta_sptps(void *handle, uint8_t type, const void *data, uint16_t length);
 extern void broadcast_meta(struct connection_t *from, const char *buffer, size_t length);
 extern bool receive_meta(struct connection_t *c);
+extern bool receive_meta_bytes(struct connection_t *c, const void *data, ssize_t length);
 
 #endif

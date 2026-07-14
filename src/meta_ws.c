@@ -351,23 +351,12 @@ static bool ws_init_context(connection_t *c);
 
 static bool ws_flush(connection_t *c) {
 	meta_ws_t *ws = c->meta_ws;
-	uint8_t out[16384];
 
-	while(wslay_event_want_write(ws->ctx)) {
-		ssize_t written = wslay_event_write(ws->ctx, out, sizeof(out));
-
-		if(written < 0) {
-			logger(DEBUG_ALWAYS, LOG_ERR, "WebSocket write failed for %s (%s)", c->name, c->hostname);
+	if(wslay_event_want_write(ws->ctx)) {
+		if(wslay_event_send(ws->ctx)) {
+			logger(DEBUG_ALWAYS, LOG_ERR, "WebSocket send failed for %s (%s)", c->name, c->hostname);
 			return false;
 		}
-
-		if(!written) {
-			break;
-		}
-
-		logger(DEBUG_META, LOG_DEBUG, "Queued %ld bytes of WebSocket metadata framing for %s (%s)",
-		       (long)written, c->name, c->hostname);
-		buffer_add(&c->outbuf, (const char *)out, (uint32_t)written);
 	}
 
 	if(c->outbuf.len) {
@@ -560,6 +549,8 @@ static ssize_t send_cb(wslay_event_context_ptr ctx, const uint8_t *data, size_t 
 	(void)ctx;
 	(void)flags;
 	connection_t *c = user_data;
+	logger(DEBUG_META, LOG_DEBUG, "Queued %lu bytes of WebSocket metadata framing for %s (%s)",
+	       (unsigned long)len, c->name, c->hostname);
 	buffer_add(&c->outbuf, (const char *)data, (uint32_t)len);
 	io_set(&c->io, IO_READ | IO_WRITE);
 	return (ssize_t)len;

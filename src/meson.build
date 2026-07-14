@@ -189,7 +189,24 @@ deps_common = []
 deps_tinc = []
 deps_tincd = [cc.find_library('m', required: false)]
 
-dep_wslay = dependency('wslay', required: opt_websocket, static: static)
+dep_wslay = dependency('wslay', required: false, static: static)
+if not dep_wslay.found()
+  dep_wslay = dependency('libwslay', required: false, static: static)
+endif
+if not dep_wslay.found()
+  dep_wslay = cc.find_library('wslay', required: opt_websocket, static: static)
+endif
+
+if dep_wslay.found() and not cc.has_header('wslay/wslay.h', dependencies: dep_wslay)
+  msg = 'wslay/wslay.h not found'
+  if opt_websocket.auto()
+    warning(msg)
+    dep_wslay = dependency('', required: false)
+  else
+    error(msg)
+  endif
+endif
+
 if dep_wslay.found()
   cdata.set('HAVE_WSLAY', 1)
   deps_tincd += dep_wslay

@@ -31,47 +31,147 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install dependencies
+      - name: Build in Debian bullseye container
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            meson \
-            ninja-build \
-            pkg-config \
-            libssl-dev \
-            zlib1g-dev \
-            libwslay-dev
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            debian:bullseye-slim \
+            bash -euxo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential \
+                meson \
+                ninja-build \
+                pkg-config \
+                libssl-dev \
+                zlib1g-dev \
+                libwslay-dev \
+                patchelf \
+                ca-certificates
 
-      - name: Configure
-        run: >
-          meson setup build-websocket
-          -Dwebsocket=enabled
-          -Dstatic=disabled
-          -Ddocs=disabled
-          -Dtests=disabled
-          -Dminiupnpc=disabled
-          -Dreadline=disabled
-          -Dcurses=disabled
-          -Dlzo=disabled
-          -Dlz4=disabled
-          -Dzlib=enabled
+              meson setup build-websocket \
+                -Dwebsocket=enabled \
+                -Dstatic=disabled \
+                -Ddocs=disabled \
+                -Dtests=disabled \
+                -Dminiupnpc=disabled \
+                -Dreadline=disabled \
+                -Dcurses=disabled \
+                -Dlzo=disabled \
+                -Dlz4=disabled \
+                -Dzlib=enabled
 
-      - name: Build
-        run: meson compile -C build-websocket --verbose
+              meson compile -C build-websocket --verbose
 
-      - name: Collect artifacts
-        run: |
-          mkdir -p artifact-linux
-          cp build-websocket/src/tinc artifact-linux/
-          cp build-websocket/src/tincd artifact-linux/
-          ldd artifact-linux/tincd > artifact-linux/tincd.ldd.txt
+              mkdir -p artifact-linux/lib
+              cp build-websocket/src/tinc artifact-linux/
+              cp build-websocket/src/tincd artifact-linux/
+              copy_deps() {
+                ldd "$1" | while read -r first second third rest; do
+                  lib=
+                  if [ "$second" = "=>" ]; then
+                    lib="$third"
+                  elif [ "${first#/}" != "$first" ]; then
+                    lib="$first"
+                  fi
+                  case "$lib" in
+                    /lib*/ld-linux*|/lib*/libc.so.*|/lib*/libpthread.so.*|/lib*/libdl.so.*|/lib*/libm.so.*|/lib*/librt.so.*|"") ;;
+                    /*) cp -n "$lib" artifact-linux/lib/ ;;
+                  esac
+                done
+              }
+              for exe in artifact-linux/tinc artifact-linux/tincd; do
+                copy_deps "$exe"
+                patchelf --set-rpath "\$ORIGIN/lib" "$exe"
+              done
+              ldd artifact-linux/tincd > artifact-linux/tincd.ldd.txt
+            '
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: tinc-websocket-linux-x86_64
           path: artifact-linux/
+
+  linux-arm64:
+    name: Linux arm64 WebSocket build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build in arm64 container
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD:/work" \
+            -w /work \
+            debian:bullseye-slim \
+            bash -euxo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential \
+                meson \
+                ninja-build \
+                pkg-config \
+                libssl-dev \
+                zlib1g-dev \
+                libwslay-dev \
+                patchelf \
+                ca-certificates
+
+              meson setup build-websocket-arm64 \
+                -Dwebsocket=enabled \
+                -Dstatic=disabled \
+                -Ddocs=disabled \
+                -Dtests=disabled \
+                -Dminiupnpc=disabled \
+                -Dreadline=disabled \
+                -Dcurses=disabled \
+                -Dlzo=disabled \
+                -Dlz4=disabled \
+                -Dzlib=enabled
+
+              meson compile -C build-websocket-arm64 --verbose
+
+              mkdir -p artifact-linux-arm64/lib
+              cp build-websocket-arm64/src/tinc artifact-linux-arm64/
+              cp build-websocket-arm64/src/tincd artifact-linux-arm64/
+              copy_deps() {
+                ldd "$1" | while read -r first second third rest; do
+                  lib=
+                  if [ "$second" = "=>" ]; then
+                    lib="$third"
+                  elif [ "${first#/}" != "$first" ]; then
+                    lib="$first"
+                  fi
+                  case "$lib" in
+                    /lib*/ld-linux*|/lib*/libc.so.*|/lib*/libpthread.so.*|/lib*/libdl.so.*|/lib*/libm.so.*|/lib*/librt.so.*|"") ;;
+                    /*) cp -n "$lib" artifact-linux-arm64/lib/ ;;
+                  esac
+                done
+              }
+              for exe in artifact-linux-arm64/tinc artifact-linux-arm64/tincd; do
+                copy_deps "$exe"
+                patchelf --set-rpath "\$ORIGIN/lib" "$exe"
+              done
+              ldd artifact-linux-arm64/tincd > artifact-linux-arm64/tincd.ldd.txt
+            '
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: tinc-websocket-linux-arm64
+          path: artifact-linux-arm64/
 
   windows:
     name: Windows WebSocket build

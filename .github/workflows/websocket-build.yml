@@ -173,6 +173,157 @@ jobs:
           name: tinc-websocket-linux-arm64
           path: artifact-linux-arm64/
 
+  alpine:
+    name: Alpine WebSocket build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build in Alpine container
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            alpine:latest \
+            sh -eux -c '
+              apk add --no-cache \
+                build-base \
+                ca-certificates \
+                git \
+                linux-headers \
+                meson \
+                ninja \
+                openssl-dev \
+                patchelf \
+                pkgconf \
+                wslay-dev \
+                zlib-dev
+
+              meson setup build-websocket-alpine \
+                -Dwebsocket=enabled \
+                -Dstatic=disabled \
+                -Ddocs=disabled \
+                -Dtests=disabled \
+                -Dminiupnpc=disabled \
+                -Dreadline=disabled \
+                -Dcurses=disabled \
+                -Dlzo=disabled \
+                -Dlz4=disabled \
+                -Dzlib=enabled
+
+              meson compile -C build-websocket-alpine --verbose
+
+              mkdir -p artifact-alpine/lib
+              cp build-websocket-alpine/src/tinc artifact-alpine/
+              cp build-websocket-alpine/src/tincd artifact-alpine/
+              copy_deps() {
+                ldd "$1" | while read -r first second third rest; do
+                  lib=
+                  if [ "$second" = "=>" ]; then
+                    lib="$third"
+                  elif [ "${first#/}" != "$first" ]; then
+                    lib="$first"
+                  fi
+                  case "$lib" in
+                    /lib/ld-musl*|/lib/libc.musl*|"") ;;
+                    /*) cp -n "$lib" artifact-alpine/lib/ ;;
+                  esac
+                done
+              }
+              for exe in artifact-alpine/tinc artifact-alpine/tincd; do
+                copy_deps "$exe"
+                patchelf --set-rpath "\$ORIGIN/lib" "$exe"
+              done
+              ldd artifact-alpine/tincd > artifact-alpine/tincd.ldd.txt
+            '
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: tinc-websocket-alpine-x86_64
+          path: artifact-alpine/
+
+  alpine-arm64:
+    name: Alpine arm64 WebSocket build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build in Alpine arm64 container
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD:/work" \
+            -w /work \
+            alpine:latest \
+            sh -eux -c '
+              apk add --no-cache \
+                build-base \
+                ca-certificates \
+                git \
+                linux-headers \
+                meson \
+                ninja \
+                openssl-dev \
+                patchelf \
+                pkgconf \
+                wslay-dev \
+                zlib-dev
+
+              meson setup build-websocket-alpine-arm64 \
+                -Dwebsocket=enabled \
+                -Dstatic=disabled \
+                -Ddocs=disabled \
+                -Dtests=disabled \
+                -Dminiupnpc=disabled \
+                -Dreadline=disabled \
+                -Dcurses=disabled \
+                -Dlzo=disabled \
+                -Dlz4=disabled \
+                -Dzlib=enabled
+
+              meson compile -C build-websocket-alpine-arm64 --verbose
+
+              mkdir -p artifact-alpine-arm64/lib
+              cp build-websocket-alpine-arm64/src/tinc artifact-alpine-arm64/
+              cp build-websocket-alpine-arm64/src/tincd artifact-alpine-arm64/
+              copy_deps() {
+                ldd "$1" | while read -r first second third rest; do
+                  lib=
+                  if [ "$second" = "=>" ]; then
+                    lib="$third"
+                  elif [ "${first#/}" != "$first" ]; then
+                    lib="$first"
+                  fi
+                  case "$lib" in
+                    /lib/ld-musl*|/lib/libc.musl*|"") ;;
+                    /*) cp -n "$lib" artifact-alpine-arm64/lib/ ;;
+                  esac
+                done
+              }
+              for exe in artifact-alpine-arm64/tinc artifact-alpine-arm64/tincd; do
+                copy_deps "$exe"
+                patchelf --set-rpath "\$ORIGIN/lib" "$exe"
+              done
+              ldd artifact-alpine-arm64/tincd > artifact-alpine-arm64/tincd.ldd.txt
+            '
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: tinc-websocket-alpine-arm64
+          path: artifact-alpine-arm64/
+
   windows:
     name: Windows WebSocket build
     runs-on: windows-latest

@@ -52,6 +52,9 @@ jobs:
                 ca-certificates
 
               meson setup build-websocket \
+                --prefix=/ \
+                --sysconfdir=etc \
+                --localstatedir=var \
                 -Dwebsocket=enabled \
                 -Dstatic=disabled \
                 -Ddocs=disabled \
@@ -130,6 +133,9 @@ jobs:
                 ca-certificates
 
               meson setup build-websocket-arm64 \
+                --prefix=/ \
+                --sysconfdir=etc \
+                --localstatedir=var \
                 -Dwebsocket=enabled \
                 -Dstatic=disabled \
                 -Ddocs=disabled \
@@ -203,6 +209,9 @@ jobs:
                 zlib-dev
 
               meson setup build-websocket-alpine \
+                --prefix=/ \
+                --sysconfdir=etc \
+                --localstatedir=var \
                 -Dwebsocket=enabled \
                 -Dstatic=disabled \
                 -Ddocs=disabled \
@@ -281,6 +290,9 @@ jobs:
                 zlib-dev
 
               meson setup build-websocket-alpine-arm64 \
+                --prefix=/ \
+                --sysconfdir=etc \
+                --localstatedir=var \
                 -Dwebsocket=enabled \
                 -Dstatic=disabled \
                 -Ddocs=disabled \

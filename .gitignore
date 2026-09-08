@@ -56,3 +56,6 @@ heaptrack.*
 /subprojects/*
 !/subprojects/*.wrap
 __pycache__
+
+# Private notes with local configuration details
+/docs/

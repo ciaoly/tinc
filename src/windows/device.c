@@ -34,13 +34,21 @@
 
 #include "common.h"
 
+#define TAP_WRITE_DEPTH 256
+
+typedef struct {
+	OVERLAPPED overlapped;
+	vpn_packet_t packet;
+	bool in_use;
+} tap_write_slot_t;
+
 int device_fd = -1;
 static HANDLE device_handle = INVALID_HANDLE_VALUE;
 static io_t device_read_io;
 static OVERLAPPED device_read_overlapped;
-static OVERLAPPED device_write_overlapped;
 static vpn_packet_t device_read_packet;
-static vpn_packet_t device_write_packet;
+static tap_write_slot_t device_write_slots[TAP_WRITE_DEPTH];
+static unsigned device_write_next;
 char *device = NULL;
 char *iface = NULL;
 static const char *device_info = "Windows tap device";
@@ -211,10 +219,10 @@ static bool setup_device(void) {
 
 			/* Warn if using >=9.21. This is because starting from 9.21, TAP-Win32 seems to use a different, less efficient write path. */
 			if(info[0] == 9 && info[1] >= 21)
-				logger(DEBUG_ALWAYS, LOG_WARNING,
+				logger(DEBUG_ALWAYS, LOG_INFO,
 				       "You are using the newer (>= 9.0.0.21, NDIS6) series of TAP-Win32 drivers. "
-				       "Using these drivers with tinc is not recommended as it can result in poor performance. "
-				       "You might want to revert back to 9.0.0.9 instead.");
+				       "tinc uses multiple parallel overlapped writes to mitigate the NDIS6 write path performance issue. "
+				       "Reverting to 9.0.0.9 is not necessary and may not work under HVCI.");
 		}
 	}
 
@@ -234,7 +242,13 @@ static bool setup_device(void) {
 	logger(DEBUG_ALWAYS, LOG_INFO, "%s (%s) is a %s", device, iface, device_info);
 
 	device_read_overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-	device_write_overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+	for(unsigned i = 0; i < TAP_WRITE_DEPTH; i++) {
+		device_write_slots[i].overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+		device_write_slots[i].in_use = false;
+	}
+
+	device_write_next = 0;
 
 	return true;
 }
@@ -281,14 +295,23 @@ static void close_device(void) {
 		logger(DEBUG_ALWAYS, LOG_ERR, "Could not wait for %s %s read to cancel: %s", device_info, device, winerror(GetLastError()));
 	}
 
-	if(device_write_packet.len > 0 && !GetOverlappedResult(device_handle, &device_write_overlapped, &len, TRUE) && GetLastError() != ERROR_OPERATION_ABORTED) {
-		logger(DEBUG_ALWAYS, LOG_ERR, "Could not wait for %s %s write to cancel: %s", device_info, device, winerror(GetLastError()));
+	for(unsigned i = 0; i < TAP_WRITE_DEPTH; i++) {
+		tap_write_slot_t *slot = &device_write_slots[i];
+
+		if(slot->in_use) {
+			if(!GetOverlappedResult(device_handle, &slot->overlapped, &len, TRUE) && GetLastError() != ERROR_OPERATION_ABORTED) {
+				logger(DEBUG_ALWAYS, LOG_ERR, "Could not wait for %s %s write to cancel: %s", device_info, device, winerror(GetLastError()));
+			}
+
+			slot->in_use = false;
+		}
 	}
 
-	device_write_packet.len = 0;
+	for(unsigned i = 0; i < TAP_WRITE_DEPTH; i++) {
+		CloseHandle(device_write_slots[i].overlapped.hEvent);
+	}
 
 	CloseHandle(device_read_overlapped.hEvent);
-	CloseHandle(device_write_overlapped.hEvent);
 
 	CloseHandle(device_handle);
 	device_handle = INVALID_HANDLE_VALUE;
@@ -311,34 +334,52 @@ static bool write_packet(vpn_packet_t *packet) {
 	logger(DEBUG_TRAFFIC, LOG_DEBUG, "Writing packet of %d bytes to %s",
 	       packet->len, device_info);
 
-	if(device_write_packet.len > 0) {
-		/* Make sure the previous write operation is finished before we start the next one;
-		   otherwise we end up with multiple write ops referencing the same OVERLAPPED structure,
-		   which according to MSDN is a no-no. */
+	/* Recycle completed write slots (non-blocking sweep). */
 
-		if(!GetOverlappedResult(device_handle, &device_write_overlapped, &outlen, FALSE)) {
-			if(GetLastError() != ERROR_IO_INCOMPLETE) {
-				logger(DEBUG_ALWAYS, LOG_ERR, "Error completing previously queued write to %s %s: %s", device_info, device, winerror(GetLastError()));
-			} else {
-				logger(DEBUG_TRAFFIC, LOG_ERR, "Previous overlapped write to %s %s still in progress", device_info, device);
-				// drop this packet
-				return true;
-			}
+	for(unsigned i = 0; i < TAP_WRITE_DEPTH; i++) {
+		tap_write_slot_t *slot = &device_write_slots[i];
+
+		if(!slot->in_use) {
+			continue;
+		}
+
+		if(GetOverlappedResult(device_handle, &slot->overlapped, &outlen, FALSE)) {
+			slot->in_use = false;
+		} else if(GetLastError() != ERROR_IO_INCOMPLETE) {
+			logger(DEBUG_ALWAYS, LOG_ERR, "Error completing previously queued write to %s %s: %s", device_info, device, winerror(GetLastError()));
+			slot->in_use = false;
 		}
 	}
 
+	/* Get the next slot in the ring. If it is still in-flight it is the oldest
+	   pending write — wait for it to complete (backpressure instead of dropping). */
+
+	tap_write_slot_t *slot = &device_write_slots[device_write_next];
+
+	if(slot->in_use) {
+		if(!GetOverlappedResult(device_handle, &slot->overlapped, &outlen, TRUE) && GetLastError() != ERROR_OPERATION_ABORTED) {
+			logger(DEBUG_ALWAYS, LOG_ERR, "Error waiting for oldest queued write to %s %s: %s", device_info, device, winerror(GetLastError()));
+		}
+
+		slot->in_use = false;
+	}
+
+	device_write_next = (device_write_next + 1) % TAP_WRITE_DEPTH;
+
 	/* Copy the packet, since the write operation might still be ongoing after we return. */
 
-	memcpy(&device_write_packet, packet, sizeof(*packet));
+	memcpy(&slot->packet, packet, sizeof(*packet));
 
-	ResetEvent(device_write_overlapped.hEvent);
+	ResetEvent(slot->overlapped.hEvent);
 
-	if(WriteFile(device_handle, DATA(&device_write_packet), device_write_packet.len, &outlen, &device_write_overlapped)) {
-		// Write was completed immediately.
-		device_write_packet.len = 0;
-	} else if(GetLastError() != ERROR_IO_PENDING) {
+	if(WriteFile(device_handle, DATA(&slot->packet), slot->packet.len, &outlen, &slot->overlapped)) {
+		/* Write was completed immediately. */
+		slot->in_use = false;
+	} else if(GetLastError() == ERROR_IO_PENDING) {
+		slot->in_use = true;
+	} else {
 		logger(DEBUG_ALWAYS, LOG_ERR, "Error while writing to %s %s: %s", device_info, device, winerror(GetLastError()));
-		device_write_packet.len = 0;
+		slot->in_use = false;
 		return false;
 	}
 

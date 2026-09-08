@@ -22,8 +22,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  linux:
-    name: Linux WebSocket build
+  bullseye:
+    name: Bullseye WebSocket build
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -37,6 +37,91 @@ jobs:
             -v "$PWD:/work" \
             -w /work \
             debian:bullseye-slim \
+            bash -euxo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              # bullseye left LTS on 2026-08-31: on deb.debian.org the
+              # security suite is being decommissioned (expired Release file,
+              # pruned pool, 404 on fetch), and archive.debian.org main alone
+              # is older than the packages shipped in the bullseye-slim base
+              # image, which breaks dependency resolution. Use a frozen
+              # snapshot of main + security from the last day of LTS instead;
+              # it is self-consistent and matches the base image.
+              # Keep bullseye (glibc 2.31) for wide binary compatibility.
+              printf "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260831T000000Z bullseye main\ndeb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/20260831T000000Z bullseye-security main\n" > /etc/apt/sources.list
+              apt-get -o Acquire::Retries=5 update
+              apt-get install -y --no-install-recommends \
+                build-essential \
+                meson \
+                ninja-build \
+                pkg-config \
+                libssl-dev \
+                zlib1g-dev \
+                libwslay-dev \
+                patchelf \
+                ca-certificates
+
+              meson setup build-websocket-bullseye \
+                --prefix=/ \
+                --sysconfdir=etc \
+                --localstatedir=var \
+                -Dwebsocket=enabled \
+                -Dstatic=disabled \
+                -Ddocs=disabled \
+                -Dtests=disabled \
+                -Dminiupnpc=disabled \
+                -Dreadline=disabled \
+                -Dcurses=disabled \
+                -Dlzo=disabled \
+                -Dlz4=disabled \
+                -Dzlib=enabled
+
+              meson compile -C build-websocket-bullseye --verbose
+
+              mkdir -p artifact-bullseye/lib
+              cp build-websocket-bullseye/src/tinc artifact-bullseye/
+              cp build-websocket-bullseye/src/tincd artifact-bullseye/
+              copy_deps() {
+                ldd "$1" | while read -r first second third rest; do
+                  lib=
+                  if [ "$second" = "=>" ]; then
+                    lib="$third"
+                  elif [ "${first#/}" != "$first" ]; then
+                    lib="$first"
+                  fi
+                  case "$lib" in
+                    /lib*/ld-linux*|/lib*/libc.so.*|/lib*/libpthread.so.*|/lib*/libdl.so.*|/lib*/libm.so.*|/lib*/librt.so.*|"") ;;
+                    /*) cp -n "$lib" artifact-bullseye/lib/ ;;
+                  esac
+                done
+              }
+              for exe in artifact-bullseye/tinc artifact-bullseye/tincd; do
+                copy_deps "$exe"
+                patchelf --set-rpath "\$ORIGIN/lib" "$exe"
+              done
+              ldd artifact-bullseye/tincd > artifact-bullseye/tincd.ldd.txt
+            '
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: tinc-websocket-bullseye-x86_64
+          path: artifact-bullseye/
+
+  linux:
+    name: Linux WebSocket build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build in Debian bookworm container
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            debian:bookworm-slim \
             bash -euxo pipefail -c '
               export DEBIAN_FRONTEND=noninteractive
               apt-get update
@@ -98,6 +183,96 @@ jobs:
           name: tinc-websocket-linux-x86_64
           path: artifact-linux/
 
+  bullseye-arm64:
+    name: Bullseye arm64 WebSocket build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build in arm64 container
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD:/work" \
+            -w /work \
+            debian:bullseye-slim \
+            bash -euxo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              # bullseye left LTS on 2026-08-31: on deb.debian.org the
+              # security suite is being decommissioned (expired Release file,
+              # pruned pool, 404 on fetch), and archive.debian.org main alone
+              # is older than the packages shipped in the bullseye-slim base
+              # image, which breaks dependency resolution. Use a frozen
+              # snapshot of main + security from the last day of LTS instead;
+              # it is self-consistent and matches the base image.
+              # Keep bullseye (glibc 2.31) for wide binary compatibility.
+              printf "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260831T000000Z bullseye main\ndeb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/20260831T000000Z bullseye-security main\n" > /etc/apt/sources.list
+              apt-get -o Acquire::Retries=5 update
+              apt-get install -y --no-install-recommends \
+                build-essential \
+                meson \
+                ninja-build \
+                pkg-config \
+                libssl-dev \
+                zlib1g-dev \
+                libwslay-dev \
+                patchelf \
+                ca-certificates
+
+              meson setup build-websocket-bullseye-arm64 \
+                --prefix=/ \
+                --sysconfdir=etc \
+                --localstatedir=var \
+                -Dwebsocket=enabled \
+                -Dstatic=disabled \
+                -Ddocs=disabled \
+                -Dtests=disabled \
+                -Dminiupnpc=disabled \
+                -Dreadline=disabled \
+                -Dcurses=disabled \
+                -Dlzo=disabled \
+                -Dlz4=disabled \
+                -Dzlib=enabled
+
+              meson compile -C build-websocket-bullseye-arm64 --verbose
+
+              mkdir -p artifact-bullseye-arm64/lib
+              cp build-websocket-bullseye-arm64/src/tinc artifact-bullseye-arm64/
+              cp build-websocket-bullseye-arm64/src/tincd artifact-bullseye-arm64/
+              copy_deps() {
+                ldd "$1" | while read -r first second third rest; do
+                  lib=
+                  if [ "$second" = "=>" ]; then
+                    lib="$third"
+                  elif [ "${first#/}" != "$first" ]; then
+                    lib="$first"
+                  fi
+                  case "$lib" in
+                    /lib*/ld-linux*|/lib*/libc.so.*|/lib*/libpthread.so.*|/lib*/libdl.so.*|/lib*/libm.so.*|/lib*/librt.so.*|"") ;;
+                    /*) cp -n "$lib" artifact-bullseye-arm64/lib/ ;;
+                  esac
+                done
+              }
+              for exe in artifact-bullseye-arm64/tinc artifact-bullseye-arm64/tincd; do
+                copy_deps "$exe"
+                patchelf --set-rpath "\$ORIGIN/lib" "$exe"
+              done
+              ldd artifact-bullseye-arm64/tincd > artifact-bullseye-arm64/tincd.ldd.txt
+            '
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: tinc-websocket-bullseye-arm64
+          path: artifact-bullseye-arm64/
+
   linux-arm64:
     name: Linux arm64 WebSocket build
     runs-on: ubuntu-24.04
@@ -117,7 +292,7 @@ jobs:
           docker run --rm --platform linux/arm64 \
             -v "$PWD:/work" \
             -w /work \
-            debian:bullseye-slim \
+            debian:bookworm-slim \
             bash -euxo pipefail -c '
               export DEBIAN_FRONTEND=noninteractive
               apt-get update

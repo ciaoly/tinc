@@ -22,7 +22,6 @@
 
 #include <windows.h>
 #include <iphlpapi.h>
-#include <ifmib.h>
 
 /* MinGW's <sal.h> does not define every extended SAL annotation that the
    official wintun.h uses. Provide harmless fallbacks so the header compiles

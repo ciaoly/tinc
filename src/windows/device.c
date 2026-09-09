@@ -21,7 +21,6 @@
 #include "../system.h"
 
 #include <windows.h>
-#include <iphlpapi.h>
 
 /* MinGW's <sal.h> does not define every extended SAL annotation that the
    official wintun.h uses. Provide harmless fallbacks so the header compiles
@@ -67,7 +66,6 @@
 static WINTUN_CREATE_ADAPTER_FUNC *WintunCreateAdapter;
 static WINTUN_OPEN_ADAPTER_FUNC *WintunOpenAdapter;
 static WINTUN_CLOSE_ADAPTER_FUNC *WintunCloseAdapter;
-static WINTUN_GET_ADAPTER_LUID_FUNC *WintunGetAdapterLUID;
 static WINTUN_START_SESSION_FUNC *WintunStartSession;
 static WINTUN_END_SESSION_FUNC *WintunEndSession;
 static WINTUN_GET_READ_WAIT_EVENT_FUNC *WintunGetReadWaitEvent;
@@ -111,7 +109,6 @@ static bool load_wintun(void) {
 	LOAD(WintunCreateAdapter);
 	LOAD(WintunOpenAdapter);
 	LOAD(WintunCloseAdapter);
-	LOAD(WintunGetAdapterLUID);
 	LOAD(WintunStartSession);
 	LOAD(WintunEndSession);
 	LOAD(WintunGetReadWaitEvent);
@@ -265,48 +262,16 @@ static bool setup_device(void) {
 		iface = xstrdup(name);
 	}
 
-	/* Wintun adapters have no IOCTL for the MAC; query it through the IP
-	   Helper API using the adapter's LUID. A freshly created adapter is not
-	   yet registered with the network stack, so GetIfEntry2 can transiently
-	   fail; retry briefly before falling back to the default MAC. */
-	NET_LUID luid;
-	WintunGetAdapterLUID(adapter_handle, &luid);
-
-	bool got_mac = false;
-	MIB_IF_ROW2 row;
-
-	for(int attempt = 0; attempt < 10; attempt++) {
-		memset(&row, 0, sizeof(row));
-		row.InterfaceLuid = luid;
-
-		if(GetIfEntry2(&row) == NO_ERROR && row.PhysicalAddressLength == ETH_ALEN) {
-			/* Some adapters briefly report an all-zero address before the
-			   real one is assigned; treat that as "not ready yet". */
-			bool nonzero = false;
-
-			for(int i = 0; i < ETH_ALEN; i++) {
-				if(row.PhysicalAddress[i]) {
-					nonzero = true;
-					break;
-				}
-			}
-
-			if(nonzero) {
-				memcpy(mymac.x, row.PhysicalAddress, ETH_ALEN);
-				got_mac = true;
-				break;
-			}
-		}
-
-		Sleep(50);
-	}
-
-	if(!got_mac) {
-		/* Harmless in router mode (the default): tinc overwrites the source
-		   MAC of every packet, and a layer-3 device has no real use for one. */
-		logger(DEBUG_ALWAYS, LOG_INFO, "Could not get MAC address from Wintun adapter %s (%s), using default", device, iface);
-	}
-
+	/* Wintun adapters have no MAC address at all: the driver is a pure
+	   layer-3 NDIS miniport (NdisMediumIP) that implements no 802.3 address
+	   OIDs, so the interface table reports a zero-length physical address,
+	   permanently. There is therefore nothing to query, unlike with the old
+	   layer-2 TAP-Windows driver. This is harmless because we synthesise and
+	   strip the Ethernet header around every packet (see the top of this
+	   file): mymac never reaches the network stack and is never read from
+	   it. In router mode - the only sensible mode for a layer-3 device -
+	   tinc routes on IP subnets, not on MAC addresses, so nodes in one VPN
+	   may all share the default MAC from route.c without any effect. */
 	if(routing_mode == RMODE_ROUTER) {
 		overwrite_mac = 1;
 	}

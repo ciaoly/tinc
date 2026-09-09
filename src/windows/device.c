@@ -1,5 +1,5 @@
 /*
-    device.c -- Interaction with the TAP-Windows driver
+    device.c -- Interaction with the Wintun driver
     Copyright (C) 2002-2005 Ivo Timmermans,
                   2002-2022 Guus Sliepen <guus@tinc-vpn.org>
 
@@ -21,10 +21,25 @@
 #include "../system.h"
 
 #include <windows.h>
-#include <winioctl.h>
+#include <iphlpapi.h>
+#include <ifmib.h>
+
+/* MinGW's <sal.h> does not define every extended SAL annotation that the
+   official wintun.h uses. Provide harmless fallbacks so the header compiles
+   regardless of the toolchain. */
+#ifndef _Must_inspect_result_
+#define _Must_inspect_result_
+#endif
+#ifndef _Return_type_success_
+#define _Return_type_success_(x)
+#endif
+#ifndef _Post_writable_byte_size_
+#define _Post_writable_byte_size_(x)
+#endif
 
 #include "../conf.h"
 #include "../device.h"
+#include "../ethernet.h"
 #include "../logger.h"
 #include "../names.h"
 #include "../net.h"
@@ -32,87 +47,172 @@
 #include "../utils.h"
 #include "../xalloc.h"
 
-#include "common.h"
+#include "wintun.h"
 
-#define TAP_WRITE_DEPTH 256
+/* Wintun is a layer-3 (raw IP) driver, unlike the old TAP-Windows driver which
+   is layer-2 (Ethernet frames). tinc's routing code, however, always works on
+   Ethernet frames: route() reads the EtherType from DATA(packet)[12..13] and
+   the IP payload from DATA(packet) + ether_size (14 bytes). To bridge the two
+   worlds we synthesise a 14-byte Ethernet header around every raw IP packet we
+   read (zero MACs + an EtherType derived from the IP version nibble) and strip
+   that header again before writing. This is the same trick tinc uses on Linux
+   for its TUN (layer-3) device, and it lets Wintun nodes interoperate with TAP
+   nodes unchanged: the on-wire protocol always carries an Ethernet frame. */
 
-typedef struct {
-	OVERLAPPED overlapped;
-	vpn_packet_t packet;
-	bool in_use;
-} tap_write_slot_t;
+#define ETH_HEADER_LEN 14
+#define WINTUN_RING_CAPACITY 0x400000 /* 4 MiB */
+#define WINTUN_DLL "wintun.dll"
+
+/* Function pointers, loaded from wintun.dll at runtime. The Wintun library is
+   only ever shipped as a signed DLL and must be loaded dynamically. */
+static WINTUN_CREATE_ADAPTER_FUNC *WintunCreateAdapter;
+static WINTUN_OPEN_ADAPTER_FUNC *WintunOpenAdapter;
+static WINTUN_CLOSE_ADAPTER_FUNC *WintunCloseAdapter;
+static WINTUN_GET_ADAPTER_LUID_FUNC *WintunGetAdapterLUID;
+static WINTUN_START_SESSION_FUNC *WintunStartSession;
+static WINTUN_END_SESSION_FUNC *WintunEndSession;
+static WINTUN_GET_READ_WAIT_EVENT_FUNC *WintunGetReadWaitEvent;
+static WINTUN_RECEIVE_PACKET_FUNC *WintunReceivePacket;
+static WINTUN_RELEASE_RECEIVE_PACKET_FUNC *WintunReleaseReceivePacket;
+static WINTUN_ALLOCATE_SEND_PACKET_FUNC *WintunAllocateSendPacket;
+static WINTUN_SEND_PACKET_FUNC *WintunSendPacket;
+
+static HMODULE wintun_lib = NULL;
+static WINTUN_ADAPTER_HANDLE adapter_handle = NULL;
+static WINTUN_SESSION_HANDLE session_handle = NULL;
+static HANDLE read_event = NULL;
+static bool adapter_created = false; /* true if we created it this run (removed on close) */
 
 int device_fd = -1;
-static HANDLE device_handle = INVALID_HANDLE_VALUE;
-static io_t device_read_io;
-static OVERLAPPED device_read_overlapped;
-static vpn_packet_t device_read_packet;
-static tap_write_slot_t device_write_slots[TAP_WRITE_DEPTH];
-static unsigned device_write_next;
 char *device = NULL;
 char *iface = NULL;
-static const char *device_info = "Windows tap device";
+static io_t device_read_io;
+static vpn_packet_t device_read_packet;
+static const char *device_info = "Windows wintun device";
 
-static void device_issue_read(void) {
-	int status;
+static bool load_wintun(void) {
+	wintun_lib = LoadLibraryA(WINTUN_DLL);
 
-	for(;;) {
-		ResetEvent(device_read_overlapped.hEvent);
+	if(!wintun_lib) {
+		logger(DEBUG_ALWAYS, LOG_ERR, "Could not load %s: %s", WINTUN_DLL, winerror(GetLastError()));
+		logger(DEBUG_ALWAYS, LOG_ERR, "Please place a signed wintun.dll (from https://www.wintun.net/) next to tincd.exe.");
+		return false;
+	}
 
-		DWORD len;
-		status = ReadFile(device_handle, (void *)device_read_packet.data, MTU, &len, &device_read_overlapped);
+	bool ok = true;
+#define LOAD(name) \
+	do { \
+		*(FARPROC *)&name = GetProcAddress(wintun_lib, #name); \
+		if(!name) { \
+			logger(DEBUG_ALWAYS, LOG_ERR, "Could not find %s in %s: %s", #name, WINTUN_DLL, winerror(GetLastError())); \
+			ok = false; \
+		} \
+	} while(0)
 
-		if(!status) {
-			if(GetLastError() != ERROR_IO_PENDING)
-				logger(DEBUG_ALWAYS, LOG_ERR, "Error while reading from %s %s: %s", device_info,
-				       device, strerror(errno));
+	LOAD(WintunCreateAdapter);
+	LOAD(WintunOpenAdapter);
+	LOAD(WintunCloseAdapter);
+	LOAD(WintunGetAdapterLUID);
+	LOAD(WintunStartSession);
+	LOAD(WintunEndSession);
+	LOAD(WintunGetReadWaitEvent);
+	LOAD(WintunReceivePacket);
+	LOAD(WintunReleaseReceivePacket);
+	LOAD(WintunAllocateSendPacket);
+	LOAD(WintunSendPacket);
+#undef LOAD
 
-			break;
+	if(!ok) {
+		FreeLibrary(wintun_lib);
+		wintun_lib = NULL;
+		return false;
+	}
+
+	return true;
+}
+
+/* Derive a deterministic GUID from the adapter name so the Windows NLA network
+   profile stays stable across tinc restarts. Not cryptographically strong. */
+static void name_to_guid(const char *name, GUID *guid) {
+	static const unsigned char base[16] = {
+		0x2a, 0x8c, 0x6d, 0x7e, 0x1f, 0x4b, 0x3a, 0x4d,
+		0x9b, 0x5e, 0x10, 0x84, 0x6f, 0x2a, 0x3d, 0xc1
+	};
+
+	unsigned char *p = (unsigned char *)guid;
+	memcpy(p, base, 16);
+
+	for(const unsigned char *s = (const unsigned char *)name; *s; s++) {
+		for(int i = 0; i < 16; i++) {
+			p[i] = (unsigned char)(p[i] * 33u + *s + (unsigned)i);
 		}
-
-		device_read_packet.len = len;
-		device_read_packet.priority = 0;
-		route(myself, &device_read_packet);
 	}
 }
 
+/* Wintun delivers raw IP packets. Frame them as Ethernet for tinc's router. */
 static void device_handle_read(void *data, int flags) {
 	(void)data;
 	(void)flags;
 
-	DWORD len;
+	for(;;) {
+		DWORD size;
+		BYTE *p = WintunReceivePacket(session_handle, &size);
 
-	if(!GetOverlappedResult(device_handle, &device_read_overlapped, &len, FALSE)) {
-		logger(DEBUG_ALWAYS, LOG_ERR, "Error getting read result from %s %s: %s", device_info,
-		       device, strerror(errno));
+		if(!p) {
+			DWORD err = GetLastError();
 
-		if(GetLastError() != ERROR_IO_INCOMPLETE) {
-			/* Must reset event or it will keep firing. */
-			ResetEvent(device_read_overlapped.hEvent);
+			if(err != ERROR_NO_MORE_ITEMS) {
+				logger(DEBUG_ALWAYS, LOG_ERR, "Error while reading from %s %s: %s", device_info,
+				       device, winerror(err));
+			}
+
+			/* ERROR_NO_MORE_ITEMS just means the ring is drained; the read
+			   event will be signalled again when more data arrives. */
+			break;
 		}
 
-		return;
-	}
+		/* Only IPv4 and IPv6 make sense on a layer-3 device. */
+		unsigned char version = (p[0] >> 4) & 0xf;
 
-	device_read_packet.len = len;
-	device_read_packet.priority = 0;
-	route(myself, &device_read_packet);
-	device_issue_read();
+		if(version != 4 && version != 6) {
+			WintunReleaseReceivePacket(session_handle, p);
+			continue;
+		}
+
+		if((size_t)size + ETH_HEADER_LEN > MAXSIZE) {
+			logger(DEBUG_ALWAYS, LOG_WARNING, "Received overlong packet (%lu bytes) from %s %s, dropping",
+			       (unsigned long)size, device_info, device);
+			WintunReleaseReceivePacket(session_handle, p);
+			continue;
+		}
+
+		uint8_t *frame = device_read_packet.data;
+
+		/* Synthesise the Ethernet header: zeroed dst/src MAC + EtherType. */
+		memset(frame, 0, 12);
+
+		if(version == 4) {
+			frame[12] = 0x08;
+			frame[13] = 0x00;
+		} else {
+			frame[12] = 0x86;
+			frame[13] = 0xDD;
+		}
+
+		memcpy(frame + ETH_HEADER_LEN, p, size);
+		WintunReleaseReceivePacket(session_handle, p);
+
+		device_read_packet.len = size + ETH_HEADER_LEN;
+		device_read_packet.priority = 0;
+
+		route(myself, &device_read_packet);
+	}
 }
 
 static bool setup_device(void) {
-	HKEY key, key2;
-	int i;
-
-	char regpath[1024];
-	char adapterid[1024];
-	char adaptername[1024];
-	char tapname[1024];
-	DWORD len;
-
-	bool found = false;
-
-	int err;
+	if(!load_wintun()) {
+		return false;
+	}
 
 	get_config_string(lookup_config(&config_tree, "Device"), &device);
 	get_config_string(lookup_config(&config_tree, "Interface"), &iface);
@@ -121,134 +221,81 @@ static bool setup_device(void) {
 		logger(DEBUG_ALWAYS, LOG_WARNING, "Warning: both Device and Interface specified, results may not be as expected");
 	}
 
-	/* Open registry and look for network adapters */
+	/* The Wintun adapter is identified by name. Prefer Interface, then the
+	   tinc network name, then "tinc". The old Device/Interface settings are
+	   reused: either may name the adapter. */
+	const char *name = iface ? iface : (device ? device : (netname ? netname : "tinc"));
 
-	if(RegOpenKeyEx(HKEY_LOCAL_MACHINE, NETWORK_CONNECTIONS_KEY, 0, KEY_READ, &key)) {
-		logger(DEBUG_ALWAYS, LOG_ERR, "Unable to read registry: %s", winerror(GetLastError()));
+	wchar_t wname[256];
+
+	if(!MultiByteToWideChar(CP_ACP, 0, name, -1, wname, sizeof(wname) / sizeof(wname[0]))) {
+		logger(DEBUG_ALWAYS, LOG_ERR, "Invalid adapter name %s: %s", name, winerror(GetLastError()));
 		return false;
 	}
 
-	for(i = 0; ; i++) {
-		len = sizeof(adapterid);
+	/* Reuse an adapter left over from a previous run if present, otherwise
+	   create one. Wintun installs its driver on demand, so unlike TAP-Windows
+	   there is no separate driver installation step. */
+	adapter_handle = WintunOpenAdapter(wname);
+	adapter_created = false;
 
-		if(RegEnumKeyEx(key, i, adapterid, &len, 0, 0, 0, NULL)) {
-			break;
+	if(!adapter_handle) {
+		GUID guid;
+		name_to_guid(name, &guid);
+
+		adapter_handle = WintunCreateAdapter(wname, L"tinc", &guid);
+
+		if(!adapter_handle) {
+			logger(DEBUG_ALWAYS, LOG_ERR, "Could not open or create Wintun adapter %s: %s", name, winerror(GetLastError()));
+			return false;
 		}
 
-		/* Find out more about this adapter */
-
-		snprintf(regpath, sizeof(regpath), "%s\\%s\\Connection", NETWORK_CONNECTIONS_KEY, adapterid);
-
-		if(RegOpenKeyEx(HKEY_LOCAL_MACHINE, regpath, 0, KEY_READ, &key2)) {
-			continue;
-		}
-
-		len = sizeof(adaptername);
-		err = RegQueryValueEx(key2, "Name", 0, 0, (LPBYTE)adaptername, &len);
-
-		RegCloseKey(key2);
-
-		if(err) {
-			continue;
-		}
-
-		if(device) {
-			if(!strcmp(device, adapterid)) {
-				found = true;
-				break;
-			} else {
-				continue;
-			}
-		}
-
-		if(iface) {
-			if(!strcmp(iface, adaptername)) {
-				found = true;
-				break;
-			} else {
-				continue;
-			}
-		}
-
-		snprintf(tapname, sizeof(tapname), USERMODEDEVICEDIR "%s" TAPSUFFIX, adapterid);
-		device_handle = CreateFile(tapname, GENERIC_WRITE | GENERIC_READ, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_SYSTEM | FILE_FLAG_OVERLAPPED, 0);
-
-		if(device_handle != INVALID_HANDLE_VALUE) {
-			found = true;
-			break;
-		}
+		adapter_created = true;
+		logger(DEBUG_ALWAYS, LOG_INFO, "Created Wintun adapter %s", name);
+	} else {
+		logger(DEBUG_ALWAYS, LOG_INFO, "Opened existing Wintun adapter %s", name);
 	}
 
-	RegCloseKey(key);
-
-	if(!found) {
-		logger(DEBUG_ALWAYS, LOG_ERR, "No Windows tap device found!");
-		return false;
-	}
-
+	/* Keep device/iface consistent for logging and the tinc-up/down scripts,
+	   which receive $DEVICE and $INTERFACE. */
 	if(!device) {
-		device = xstrdup(adapterid);
+		device = xstrdup(name);
 	}
 
 	if(!iface) {
-		iface = xstrdup(adaptername);
+		iface = xstrdup(name);
 	}
 
-	/* Try to open the corresponding tap device */
+	/* Wintun adapters have no IOCTL for the MAC; query it through the IP
+	   Helper API using the adapter's LUID. */
+	NET_LUID luid;
+	WintunGetAdapterLUID(adapter_handle, &luid);
 
-	if(device_handle == INVALID_HANDLE_VALUE) {
-		snprintf(tapname, sizeof(tapname), USERMODEDEVICEDIR "%s" TAPSUFFIX, device);
-		device_handle = CreateFile(tapname, GENERIC_WRITE | GENERIC_READ, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_SYSTEM | FILE_FLAG_OVERLAPPED, 0);
-	}
+	MIB_IF_ROW2 row = {0};
+	row.InterfaceLuid = luid;
 
-	if(device_handle == INVALID_HANDLE_VALUE) {
-		logger(DEBUG_ALWAYS, LOG_ERR, "%s (%s) is not a usable Windows tap device: %s", device, iface, winerror(GetLastError()));
-		return false;
-	}
-
-	/* Get version information from tap device */
-
-	{
-		ULONG info[3] = {0};
-		DWORD len;
-
-		if(!DeviceIoControl(device_handle, TAP_IOCTL_GET_VERSION, &info, sizeof(info), &info, sizeof(info), &len, NULL)) {
-			logger(DEBUG_ALWAYS, LOG_WARNING, "Could not get version information from Windows tap device %s (%s): %s", device, iface, winerror(GetLastError()));
-		} else {
-			logger(DEBUG_ALWAYS, LOG_INFO, "TAP-Windows driver version: %lu.%lu%s", info[0], info[1], info[2] ? " (DEBUG)" : "");
-
-			/* Warn if using >=9.21. This is because starting from 9.21, TAP-Win32 seems to use a different, less efficient write path. */
-			if(info[0] == 9 && info[1] >= 21)
-				logger(DEBUG_ALWAYS, LOG_INFO,
-				       "You are using the newer (>= 9.0.0.21, NDIS6) series of TAP-Win32 drivers. "
-				       "tinc uses multiple parallel overlapped writes to mitigate the NDIS6 write path performance issue. "
-				       "Reverting to 9.0.0.9 is not necessary and may not work under HVCI.");
-		}
-	}
-
-	/* Get MAC address from tap device */
-
-	if(!DeviceIoControl(device_handle, TAP_IOCTL_GET_MAC, mymac.x, sizeof(mymac.x), mymac.x, sizeof(mymac.x), &len, 0)) {
-		logger(DEBUG_ALWAYS, LOG_ERR, "Could not get MAC address from Windows tap device %s (%s): %s", device, iface, winerror(GetLastError()));
-		return false;
+	if(GetIfEntry2(&row) == NO_ERROR && row.PhysicalAddressLength == ETH_ALEN) {
+		memcpy(mymac.x, row.PhysicalAddress, ETH_ALEN);
+	} else {
+		logger(DEBUG_ALWAYS, LOG_WARNING, "Could not get MAC address from Wintun adapter %s (%s), using default", device, iface);
 	}
 
 	if(routing_mode == RMODE_ROUTER) {
 		overwrite_mac = 1;
 	}
 
-	device_info = "Windows tap device";
+	session_handle = WintunStartSession(adapter_handle, WINTUN_RING_CAPACITY);
 
-	logger(DEBUG_ALWAYS, LOG_INFO, "%s (%s) is a %s", device, iface, device_info);
-
-	device_read_overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-
-	for(unsigned i = 0; i < TAP_WRITE_DEPTH; i++) {
-		device_write_slots[i].overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-		device_write_slots[i].in_use = false;
+	if(!session_handle) {
+		logger(DEBUG_ALWAYS, LOG_ERR, "Could not start Wintun session on %s (%s): %s", device, iface, winerror(GetLastError()));
+		return false;
 	}
 
-	device_write_next = 0;
+	read_event = WintunGetReadWaitEvent(session_handle);
+
+	device_info = "Windows wintun device";
+
+	logger(DEBUG_ALWAYS, LOG_INFO, "%s (%s) is a %s", device, iface, device_info);
 
 	return true;
 }
@@ -256,65 +303,40 @@ static bool setup_device(void) {
 static void enable_device(void) {
 	logger(DEBUG_ALWAYS, LOG_INFO, "Enabling %s", device_info);
 
-	ULONG status = 1;
-	DWORD len;
-	DeviceIoControl(device_handle, TAP_IOCTL_SET_MEDIA_STATUS, &status, sizeof(status), &status, sizeof(status), &len, NULL);
-
-	/* We don't use the write event directly, but GetOverlappedResult() does, internally. */
-
-	io_add_event(&device_read_io, device_handle_read, NULL, device_read_overlapped.hEvent);
-	device_issue_read();
+	/* The session is already active; just register the read wait event with
+	   the event loop and drain anything already queued. */
+	io_add_event(&device_read_io, device_handle_read, NULL, read_event);
+	device_handle_read(NULL, 0);
 }
 
 static void disable_device(void) {
 	logger(DEBUG_ALWAYS, LOG_INFO, "Disabling %s", device_info);
 
 	io_del(&device_read_io);
-
-	ULONG status = 0;
-	DWORD len;
-	DeviceIoControl(device_handle, TAP_IOCTL_SET_MEDIA_STATUS, &status, sizeof(status), &status, sizeof(status), &len, NULL);
-
-	/* Note that we don't try to cancel ongoing I/O here - we just stop listening.
-	   This is because some TAP-Win32 drivers don't seem to handle cancellation very well,
-	   especially when combined with other events such as the computer going to sleep - cases
-	   were observed where the GetOverlappedResult() would just block indefinitely and never
-	   return in that case. */
 }
 
 static void close_device(void) {
-	CancelIo(device_handle);
-
-	/* According to MSDN, CancelIo() does not necessarily wait for the operation to complete.
-	   To prevent race conditions, make sure the operation is complete
-	   before we close the event it's referencing. */
-
-	DWORD len;
-
-	if(!GetOverlappedResult(device_handle, &device_read_overlapped, &len, TRUE) && GetLastError() != ERROR_OPERATION_ABORTED) {
-		logger(DEBUG_ALWAYS, LOG_ERR, "Could not wait for %s %s read to cancel: %s", device_info, device, winerror(GetLastError()));
+	if(session_handle) {
+		WintunEndSession(session_handle);
+		session_handle = NULL;
+		/* read_event is owned by the session; do not close it. */
+		read_event = NULL;
 	}
 
-	for(unsigned i = 0; i < TAP_WRITE_DEPTH; i++) {
-		tap_write_slot_t *slot = &device_write_slots[i];
-
-		if(slot->in_use) {
-			if(!GetOverlappedResult(device_handle, &slot->overlapped, &len, TRUE) && GetLastError() != ERROR_OPERATION_ABORTED) {
-				logger(DEBUG_ALWAYS, LOG_ERR, "Could not wait for %s %s write to cancel: %s", device_info, device, winerror(GetLastError()));
-			}
-
-			slot->in_use = false;
-		}
+	if(adapter_handle) {
+		/* WintunCloseAdapter removes adapters created with WintunCreateAdapter
+		   and merely releases handles opened with WintunOpenAdapter. Removing
+		   on close matches tinc's tinc-up/tinc-down lifecycle: the adapter
+		   (and its IP configuration) lives exactly while tincd runs. */
+		WintunCloseAdapter(adapter_handle);
+		adapter_handle = NULL;
+		adapter_created = false;
 	}
 
-	for(unsigned i = 0; i < TAP_WRITE_DEPTH; i++) {
-		CloseHandle(device_write_slots[i].overlapped.hEvent);
+	if(wintun_lib) {
+		FreeLibrary(wintun_lib);
+		wintun_lib = NULL;
 	}
-
-	CloseHandle(device_read_overlapped.hEvent);
-
-	CloseHandle(device_handle);
-	device_handle = INVALID_HANDLE_VALUE;
 
 	free(device);
 	device = NULL;
@@ -324,64 +346,46 @@ static void close_device(void) {
 }
 
 static bool read_packet(vpn_packet_t *packet) {
+	/* Reads are event-driven via device_handle_read(); this entry point is unused. */
 	(void)packet;
 	return false;
 }
 
 static bool write_packet(vpn_packet_t *packet) {
-	DWORD outlen;
-
 	logger(DEBUG_TRAFFIC, LOG_DEBUG, "Writing packet of %d bytes to %s",
 	       packet->len, device_info);
 
-	/* Recycle completed write slots (non-blocking sweep). */
-
-	for(unsigned i = 0; i < TAP_WRITE_DEPTH; i++) {
-		tap_write_slot_t *slot = &device_write_slots[i];
-
-		if(!slot->in_use) {
-			continue;
-		}
-
-		if(GetOverlappedResult(device_handle, &slot->overlapped, &outlen, FALSE)) {
-			slot->in_use = false;
-		} else if(GetLastError() != ERROR_IO_INCOMPLETE) {
-			logger(DEBUG_ALWAYS, LOG_ERR, "Error completing previously queued write to %s %s: %s", device_info, device, winerror(GetLastError()));
-			slot->in_use = false;
-		}
-	}
-
-	/* Get the next slot in the ring. If it is still in-flight it is the oldest
-	   pending write — wait for it to complete (backpressure instead of dropping). */
-
-	tap_write_slot_t *slot = &device_write_slots[device_write_next];
-
-	if(slot->in_use) {
-		if(!GetOverlappedResult(device_handle, &slot->overlapped, &outlen, TRUE) && GetLastError() != ERROR_OPERATION_ABORTED) {
-			logger(DEBUG_ALWAYS, LOG_ERR, "Error waiting for oldest queued write to %s %s: %s", device_info, device, winerror(GetLastError()));
-		}
-
-		slot->in_use = false;
-	}
-
-	device_write_next = (device_write_next + 1) % TAP_WRITE_DEPTH;
-
-	/* Copy the packet, since the write operation might still be ongoing after we return. */
-
-	memcpy(&slot->packet, packet, sizeof(*packet));
-
-	ResetEvent(slot->overlapped.hEvent);
-
-	if(WriteFile(device_handle, DATA(&slot->packet), slot->packet.len, &outlen, &slot->overlapped)) {
-		/* Write was completed immediately. */
-		slot->in_use = false;
-	} else if(GetLastError() == ERROR_IO_PENDING) {
-		slot->in_use = true;
-	} else {
-		logger(DEBUG_ALWAYS, LOG_ERR, "Error while writing to %s %s: %s", device_info, device, winerror(GetLastError()));
-		slot->in_use = false;
+	if(packet->len < ETH_HEADER_LEN) {
 		return false;
 	}
+
+	/* Wintun only accepts raw IP. Strip the synthesised Ethernet header and
+	   drop anything that is not IPv4/IPv6 (e.g. ARP). */
+	uint16_t type = DATA(packet)[12] << 8 | DATA(packet)[13];
+
+	if(type != ETH_P_IP && type != ETH_P_IPV6) {
+		logger(DEBUG_TRAFFIC, LOG_DEBUG, "Dropping non-IP frame (type %hx) to %s", type, device_info);
+		return true;
+	}
+
+	DWORD iplen = packet->len - ETH_HEADER_LEN;
+	BYTE *buf = WintunAllocateSendPacket(session_handle, iplen);
+
+	if(!buf) {
+		DWORD err = GetLastError();
+
+		if(err == ERROR_BUFFER_OVERFLOW) {
+			/* Ring full: apply backpressure by dropping. */
+			logger(DEBUG_TRAFFIC, LOG_WARNING, "Wintun send ring full, dropping packet to %s", device_info);
+			return true;
+		}
+
+		logger(DEBUG_ALWAYS, LOG_ERR, "Error while writing to %s %s: %s", device_info, device, winerror(err));
+		return false;
+	}
+
+	memcpy(buf, DATA(packet) + ETH_HEADER_LEN, iplen);
+	WintunSendPacket(session_handle, buf);
 
 	return true;
 }

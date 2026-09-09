@@ -196,10 +196,14 @@ The virtual network device to use.
 .Nm tinc
 will automatically detect what kind of device it is.
 Note that you can only use one device per daemon.
-Under Windows, use
+Under Windows,
+.Va Device
+or
 .Va Interface
-instead of
-.Va Device .
+names the Wintun adapter; if neither is set the network name is used, and the
+adapter is created automatically when
+.Nm tinc
+starts.
 The info pages of the tinc package contain more information
 about configuring the virtual network device.
 .It Va DeviceStandby Li = yes | no Po no Pc
@@ -208,7 +212,7 @@ When disabled,
 calls tinc-up on startup, and tinc-down on shutdown. When enabled,
 .Nm tinc
 will only call tinc-up when at least one node is reachable, and will call tinc-down as soon as no nodes are reachable.
-On Windows, this also determines when the virtual network interface "cable" is "plugged".
+On Windows, this also determines when the virtual network interface is activated.
 .It Va DeviceType Li = Ar type Pq platform dependent
 The type of the virtual network device.
 Tinc will normally automatically select the right type of tun/tap interface, and this option should not be used.

@@ -20,12 +20,10 @@ Section "Tinc"
 
   File ..\..\..\default\src\tinc.exe
   File ..\..\..\default\src\tincd.exe
-  File ..\..\..\wintap.exe
+  File wintun.dll
 
   CreateDirectory "$SMPROGRAMS\Tinc"
   CreateShortCut "$SMPROGRAMS\Tinc.lnk" "$INSTDIR\tinc.exe"
-
-  ExecWait "wintap.exe"
 
   CreateDirectory "$SMPROGRAMS\tinc"
 SectionEnd

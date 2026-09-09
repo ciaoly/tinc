@@ -323,11 +323,23 @@ to configure the host side of a vmnet device.
 @node       Configuration of Windows
 @subsection Configuration of Windows
 
-You will need to install the latest TAP-Win32 driver from OpenVPN.
-You can download it from @uref{https://openvpn.net/index.php/open-source/downloads.html}.
-Using the Network Connections control panel,
-configure the TAP-Win32 network interface in the same way as you would do from the tinc-up script,
-as explained in the rest of the documentation.
+On Windows, tinc uses the Wintun layer-3 tunneling driver
+(@uref{https://www.wintun.net/}).  The Windows installer bundles a signed
+@file{wintun.dll} next to @command{tincd}; tincd loads it at runtime and creates
+the virtual adapter on demand, so unlike the older TAP-Windows driver there is no
+separate driver installation step.  Wintun is a layer-3 device, which means it
+only carries IPv4 and IPv6 packets and is best used with @samp{Mode = router}
+(the default); switch and hub modes are not meaningful on a layer-3 device.
+
+The adapter is named after the @samp{Interface} setting, or failing that the
+network name, or @samp{tinc} if neither is set.  Configure its IP address and
+routes from the @file{tinc-up} script as explained in the rest of the
+documentation, for example with @command{netsh interface ip set address
+"@env{INTERFACE}" static X.X.X.X 255.255.255.0}.
+
+If you run @command{tincd} without the installer, place a signed
+@file{wintun.dll} in the same directory as @command{tincd.exe}; tincd will fail
+to start with a clear error message if the DLL cannot be found.
 
 
 @c ==================================================================

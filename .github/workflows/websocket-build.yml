@@ -2,6 +2,8 @@ name: WebSocket build
 
 on:
   push:
+    branches-ignore:
+      - wintun-support
     paths:
       - ".github/workflows/websocket-build.yml"
       - "meson.build"

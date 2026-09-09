@@ -1,0 +1,122 @@
+name: Wintun build
+
+on:
+  push:
+    branches:
+      - wintun-support
+    paths:
+      - ".github/workflows/wintun-build.yml"
+      - "meson.build"
+      - "meson_options.txt"
+      - "src/**"
+      - ".ci/package/win/**"
+  pull_request:
+    branches:
+      - wintun-support
+  workflow_dispatch:
+
+concurrency:
+  group: wintun-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows Wintun build
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          msystem: MINGW64
+          install: >-
+            base-devel
+            git
+            unzip
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-zlib
+
+      - name: Install wslay
+        shell: msys2 {0}
+        run: |
+          pacman -S --needed --noconfirm mingw-w64-x86_64-wslay || \
+          pacman -S --needed --noconfirm mingw-w64-x86_64-libwslay
+
+      - name: Configure
+        shell: msys2 {0}
+        run: >
+          meson setup build-wintun
+          -Dwebsocket=enabled
+          -Dstatic=disabled
+          -Ddocs=disabled
+          -Dtests=disabled
+          -Dminiupnpc=disabled
+          -Dreadline=disabled
+          -Dcurses=disabled
+          -Dlzo=disabled
+          -Dlz4=disabled
+          -Dzlib=enabled
+
+      - name: Build
+        shell: msys2 {0}
+        run: meson compile -C build-wintun --verbose
+
+      - name: Fetch wintun.dll
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri 'https://www.wintun.net/builds/wintun-0.14.1.zip' -OutFile wintun.zip
+          Expand-Archive -Path wintun.zip -DestinationPath wintun-extracted -Force
+          Copy-Item wintun-extracted/wintun/bin/amd64/wintun.dll .
+          Copy-Item wintun-extracted/wintun/bin/amd64/wintun.dll .ci/package/win/
+
+      - name: Collect runnable artifact
+        shell: msys2 {0}
+        run: |
+          mkdir -p artifact-windows
+          cp build-wintun/src/tinc.exe artifact-windows/
+          cp build-wintun/src/tincd.exe artifact-windows/
+          cp wintun.dll artifact-windows/
+          for exe in artifact-windows/*.exe; do
+            ldd "$exe" | awk '/mingw64/ { print $3 }' | while read -r dll; do
+              [ -n "$dll" ] && cp -n "$dll" artifact-windows/
+            done
+          done
+          ldd artifact-windows/tincd.exe > artifact-windows/tincd.ldd.txt
+
+      - name: Upload runnable artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: tinc-wintun-windows-x86_64
+          path: artifact-windows/
+
+      - name: Install NSIS
+        shell: msys2 {0}
+        continue-on-error: true
+        run: pacman -S --needed --noconfirm mingw-w64-x86_64-nsis
+
+      - name: Build NSIS installer
+        shell: msys2 {0}
+        continue-on-error: true
+        run: |
+          # installer.nsi expects the built binaries at <root>/default/src/.
+          mkdir -p default/src
+          cp build-wintun/src/tinc.exe default/src/
+          cp build-wintun/src/tincd.exe default/src/
+          makensis .ci/package/win/installer.nsi
+
+      - name: Upload NSIS installer
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: tinc-wintun-windows-installer
+          path: tinc-x64.exe
+          if-no-files-found: ignore

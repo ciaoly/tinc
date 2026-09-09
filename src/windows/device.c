@@ -266,17 +266,45 @@ static bool setup_device(void) {
 	}
 
 	/* Wintun adapters have no IOCTL for the MAC; query it through the IP
-	   Helper API using the adapter's LUID. */
+	   Helper API using the adapter's LUID. A freshly created adapter is not
+	   yet registered with the network stack, so GetIfEntry2 can transiently
+	   fail; retry briefly before falling back to the default MAC. */
 	NET_LUID luid;
 	WintunGetAdapterLUID(adapter_handle, &luid);
 
-	MIB_IF_ROW2 row = {0};
-	row.InterfaceLuid = luid;
+	bool got_mac = false;
+	MIB_IF_ROW2 row;
 
-	if(GetIfEntry2(&row) == NO_ERROR && row.PhysicalAddressLength == ETH_ALEN) {
-		memcpy(mymac.x, row.PhysicalAddress, ETH_ALEN);
-	} else {
-		logger(DEBUG_ALWAYS, LOG_WARNING, "Could not get MAC address from Wintun adapter %s (%s), using default", device, iface);
+	for(int attempt = 0; attempt < 10; attempt++) {
+		memset(&row, 0, sizeof(row));
+		row.InterfaceLuid = luid;
+
+		if(GetIfEntry2(&row) == NO_ERROR && row.PhysicalAddressLength == ETH_ALEN) {
+			/* Some adapters briefly report an all-zero address before the
+			   real one is assigned; treat that as "not ready yet". */
+			bool nonzero = false;
+
+			for(int i = 0; i < ETH_ALEN; i++) {
+				if(row.PhysicalAddress[i]) {
+					nonzero = true;
+					break;
+				}
+			}
+
+			if(nonzero) {
+				memcpy(mymac.x, row.PhysicalAddress, ETH_ALEN);
+				got_mac = true;
+				break;
+			}
+		}
+
+		Sleep(50);
+	}
+
+	if(!got_mac) {
+		/* Harmless in router mode (the default): tinc overwrites the source
+		   MAC of every packet, and a layer-3 device has no real use for one. */
+		logger(DEBUG_ALWAYS, LOG_INFO, "Could not get MAC address from Wintun adapter %s (%s), using default", device, iface);
 	}
 
 	if(routing_mode == RMODE_ROUTER) {

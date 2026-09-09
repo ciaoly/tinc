@@ -196,11 +196,6 @@ bool execute_script(const char *name, environment_t *env) {
 		if(!found) {
 			return true;
 		}
-
-		/* fullname now names an existing script. Copy it back, otherwise the
-		   access() check below tests the extension-less scriptname, fails,
-		   and the script we just found would be silently skipped. */
-		snprintf(scriptname, sizeof(scriptname), "%s", fullname);
 	} else
 #endif
 
